@@ -6,19 +6,11 @@
 #include "core/UpsDevice.h"
 #include "utils/Utf.h"
 
-#include <d3d11.h>
-#include <wrl/client.h>
-#include <windowsx.h>
-#include <string>
 #include <algorithm>
-
-extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
-    HWND, UINT, WPARAM, LPARAM
-);
+#include <cstdio>
+#include <string>
 
 namespace Ups {
-
-    using Microsoft::WRL::ComPtr;
 
     // ============================================================================
     //                          UI LAYOUT CONFIGURATION
@@ -29,10 +21,20 @@ namespace Ups {
         constexpr float WINDOW_HEIGHT = 480.0f;
         constexpr float MARGIN = 16.0f;
         constexpr float TASKBAR_H = 50.0f;
+        constexpr float CAPTION_H = 50.0f;
         constexpr float CLOSE_SIZE = 20.0f;
+        constexpr float LABEL_W = 128.0f;
         constexpr float BAR_HEIGHT = 14.0f;
         constexpr float BAR_ROUNDING = 4.0f;
         constexpr float ROW_SPACING = 4.0f;
+        constexpr float FOOTER_H = 60.0f;
+        constexpr float BUTTON_H = 20.0f;
+        constexpr float GAP_BAR = 2.0f;
+        constexpr float GAP_SECTION = 12.0f;
+        constexpr float GAP_CTRL = 8.0f;
+        constexpr float GAP_FOOTER = 6.0f;
+
+        constexpr ULONGLONG POLL_INTERVAL_MS = 1000;
     }
 
     // ============================================================================
@@ -42,7 +44,6 @@ namespace Ups {
     namespace Theme {
         constexpr ImVec4 BG_WIN = { 0.13f, 0.13f, 0.15f, 1.0f };
         constexpr ImVec4 BG_BAR = { 0.22f, 0.22f, 0.25f, 1.0f };
-        constexpr ImVec4 SEPARATOR = { 0.22f, 0.22f, 0.25f, 1.0f };
         constexpr ImVec4 TEXT_MAIN = { 0.92f, 0.92f, 0.94f, 1.0f };
         constexpr ImVec4 TEXT_SUB = { 0.70f, 0.70f, 0.75f, 1.0f };
         constexpr ImVec4 TEXT_DIM = { 0.50f, 0.50f, 0.55f, 1.0f };
@@ -52,7 +53,12 @@ namespace Ups {
         constexpr ImVec4 COL_CRIT = { 0.85f, 0.35f, 0.35f, 1.0f };
         constexpr ImVec4 COL_INFO = { 0.30f, 0.65f, 0.95f, 1.0f };
 
-        [[nodiscard]] inline ImVec4 GetHealthColor(Health h) {
+        struct StatusLook {
+            const char* text;
+            ImVec4      color;
+        };
+
+        [[nodiscard]] inline ImVec4 ColorOf(Health h) {
             switch (h) {
             case Health::Good:     return COL_OK;
             case Health::Warning:  return COL_WARN;
@@ -61,15 +67,38 @@ namespace Ups {
             }
         }
 
-        [[nodiscard]] inline ImVec4 GetStatusColor(PowerStatus s) {
+        [[nodiscard]] inline ImVec4 ColorOf(AvrStatus s) {
+            return s == AvrStatus::Normal ? COL_OK : COL_INFO;
+        }
+
+        [[nodiscard]] inline StatusLook StatusOf(PowerStatus s) {
             switch (s) {
-            case PowerStatus::Disconnected:
-            case PowerStatus::Overload:
-            case PowerStatus::BadBattery:  return COL_CRIT;
-            case PowerStatus::OnBattery:   return COL_WARN;
-            case PowerStatus::Charging:    return COL_INFO;
-            default:                       return COL_OK;
+            case PowerStatus::Disconnected: return { "DISCONNECTED", COL_CRIT };
+            case PowerStatus::OnBattery:    return { "BATTERY MODE", COL_WARN };
+            case PowerStatus::Charging:     return { "CHARGING", COL_INFO };
+            case PowerStatus::Overload:     return { "OVERLOAD", COL_CRIT };
+            case PowerStatus::BadBattery:   return { "REPLACE BATTERY", COL_CRIT };
+            case PowerStatus::Boost:        return { "AVR BOOST", COL_OK };
+            case PowerStatus::Trim:         return { "AVR TRIM", COL_OK };
+            default:                        return { "ONLINE", COL_OK };
             }
+        }
+
+        inline void Apply() {
+            auto& s = ImGui::GetStyle();
+            s.WindowRounding = 0.0f;
+            s.FrameRounding = Layout::BAR_ROUNDING;
+            s.WindowPadding = { 10, 10 };
+            s.ItemSpacing = { 8, Layout::ROW_SPACING };
+            s.SeparatorTextAlign = { 0.5f, 0.5f };
+            s.SeparatorTextBorderSize = 1.0f;
+
+            s.Colors[ImGuiCol_WindowBg] = BG_WIN;
+            s.Colors[ImGuiCol_Text] = TEXT_MAIN;
+            s.Colors[ImGuiCol_TextDisabled] = TEXT_DIM;
+            s.Colors[ImGuiCol_Separator] = BG_BAR;
+            s.Colors[ImGuiCol_FrameBg] = BG_BAR;
+            s.Colors[ImGuiCol_PlotHistogram] = COL_OK;
         }
     }
 
@@ -77,88 +106,371 @@ namespace Ups {
     //                              UI HELPERS
     // ============================================================================
 
+    template<size_t N>
+    void CopyText(char(&dst)[N], const char* src) {
+        std::snprintf(dst, N, "%s", src ? src : "");
+    }
+
+    template<size_t N>
+    void CopyText(char(&dst)[N], const std::string& src) {
+        CopyText(dst, src.c_str());
+    }
+
+    struct Line {
+        const char* label = "";
+        char        text[32]{};
+        ImVec4      color = Theme::TEXT_DIM;
+        float       frac = 0.0f;
+        bool        visible = false;
+
+        template<class T>
+        void Set(
+            const char* l,
+            const T& t,
+            const ImVec4& c,
+            bool vis = true,
+            float f = 0.0f)
+        {
+            label = l;
+            color = c;
+            visible = vis;
+            frac = f;
+            text[0] = '\0';
+            if (vis) {
+                CopyText(text, t);
+            }
+        }
+    };
+
     struct UI {
-        static void CenterText(const char* text, const ImVec4& color) {
-            const float w = ImGui::GetContentRegionAvail().x;
-            ImGui::SetCursorPosX((w - ImGui::CalcTextSize(text).x) * 0.5f);
+        static void Gap(float h) {
+            ImGui::Dummy({ 0, h });
+        }
+
+        static void FillWidth() {
+            ImGui::SetNextItemWidth(-FLT_MIN);
+        }
+
+        // 0 = left, 0.5 = center, 1 = right
+        static void TextAligned(float align, const char* text, const ImVec4& color) {
+            const float slack = ImGui::GetContentRegionAvail().x
+                - ImGui::CalcTextSize(text).x;
+            if (slack > 0.0f) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + slack * align);
+            }
             ImGui::TextColored(color, "%s", text);
         }
 
-        static void MetricRow(
-            const char* label,
-            const std::string& value,
-            const ImVec4& valColor)
-        {
-            ImGui::TableNextRow();
-
-            ImGui::TableSetColumnIndex(0);
-            ImGui::TextColored(Theme::TEXT_DIM, "%s", label);
-
-            ImGui::TableSetColumnIndex(1);
-            const float w = ImGui::CalcTextSize(value.c_str()).x;
-            ImGui::SetCursorPosX(
-                ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - w
-            );
-            ImGui::TextColored(valColor, "%s", value.c_str());
+        static void LabelCol(const char* text) {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("%s", text);
+            ImGui::SameLine(Layout::LABEL_W);
         }
 
-        static void ProgressBar(
-            const char* label,
-            float fraction,
-            const ImVec4& color)
-        {
-            ImGui::BeginGroup();
+        static void MetricRow(const Line& item) {
+            if (!item.visible) {
+                return;
+            }
+            LabelCol(item.label);
+            TextAligned(1.0f, item.text, item.color);
+        }
 
-            ImGui::PushStyleColor(ImGuiCol_Text, Theme::TEXT_DIM);
-            ImGui::Text("%-6s", label);
+        static bool WideButton(const char* label) {
+            return ImGui::Button(label, { -FLT_MIN, Layout::BUTTON_H });
+        }
+
+        static bool Combo(const char* label, int* sel, const char* items) {
+            LabelCol(label);
+            FillWidth();
+            ImGui::PushID(label);
+            const bool changed = ImGui::Combo("##v", sel, items);
+            ImGui::PopID();
+            return changed;
+        }
+
+        static void Bar(const Line& item) {
+            const float frac = std::clamp(item.frac, 0.0f, 1.0f);
+            char overlay[8];
+            std::snprintf(overlay, sizeof(overlay), "%.0f%%", frac * 100.0f);
+
+            LabelCol(item.label);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, item.color);
+            ImGui::ProgressBar(frac, { -FLT_MIN, Layout::BAR_HEIGHT }, overlay);
             ImGui::PopStyleColor();
-            ImGui::SameLine();
+        }
 
-            const float availW = ImGui::GetContentRegionAvail().x;
-            const float percentW = ImGui::CalcTextSize("100%").x;
-            const float barW = availW - percentW - 8.0f;
+        template<size_t N>
+        static void DrawMetrics(const Line(&items)[N]) {
+            for (const Line& item : items) {
+                MetricRow(item);
+            }
+        }
 
-            ImVec2 pos = ImGui::GetCursorScreenPos();
-            pos.y += (ImGui::GetTextLineHeight() - Layout::BAR_HEIGHT) * 0.5f;
+        template<size_t N>
+        static void DrawBars(const Line(&bars)[N]) {
+            for (size_t i = 0; i < N; ++i) {
+                if (i > 0) {
+                    Gap(Layout::GAP_BAR);
+                }
+                Bar(bars[i]);
+            }
+        }
 
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-
-            // Background
-            dl->AddRectFilled(
-                pos,
-                { pos.x + barW, pos.y + Layout::BAR_HEIGHT },
-                ImGui::ColorConvertFloat4ToU32(Theme::BG_BAR),
-                Layout::BAR_ROUNDING
-            );
-
-            // Foreground
-            const float fillW = barW * std::clamp(fraction, 0.0f, 1.0f);
-            if (fillW > 1.0f) {
-                dl->AddRectFilled(
-                    pos,
-                    { pos.x + fillW, pos.y + Layout::BAR_HEIGHT },
-                    ImGui::ColorConvertFloat4ToU32(color),
-                    Layout::BAR_ROUNDING
-                );
+        template<size_t N>
+        static void DrawFooter(const Line(&lines)[N], int count) {
+            const float y = ImGui::GetWindowHeight() - Layout::FOOTER_H;
+            if (ImGui::GetCursorPosY() < y) {
+                ImGui::SetCursorPosY(y);
             }
 
-            ImGui::Dummy({ barW, ImGui::GetTextLineHeight() });
-            ImGui::SameLine();
-            ImGui::TextColored(color, "%3.0f%%", fraction * 100.0f);
+            ImGui::Separator();
+            Gap(Layout::GAP_FOOTER);
 
-            ImGui::EndGroup();
+            const int n = (count < static_cast<int>(N)) ? count : static_cast<int>(N);
+            for (int i = 0; i < n; ++i) {
+                TextAligned(0.5f, lines[i].text, lines[i].color);
+            }
         }
 
-        [[nodiscard]] static const char* StatusToString(PowerStatus s) {
-            switch (s) {
-            case PowerStatus::Disconnected: return "DISCONNECTED";
-            case PowerStatus::OnBattery:    return "BATTERY MODE";
-            case PowerStatus::Charging:     return "CHARGING";
-            case PowerStatus::Overload:     return "OVERLOAD";
-            case PowerStatus::BadBattery:   return "REPLACE BATTERY";
-            case PowerStatus::Boost:        return "AVR BOOST";
-            case PowerStatus::Trim:         return "AVR TRIM";
-            default:                        return "ONLINE";
+        static bool CloseButton() {
+            ImGui::SetCursorPosX(
+                ImGui::GetWindowWidth()
+                - Layout::CLOSE_SIZE
+                - ImGui::GetStyle().WindowPadding.x
+            );
+
+            ImGui::PushStyleColor(ImGuiCol_Button, { 0, 0, 0, 0 });
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Theme::BTN_CLOSE_H);
+            const bool clicked = ImGui::SmallButton("X");
+            ImGui::PopStyleColor(2);
+            return clicked;
+        }
+
+        static void StatusHeader(PowerStatus s) {
+            const auto st = Theme::StatusOf(s);
+            ImGui::PushStyleColor(ImGuiCol_Text, st.color);
+            ImGui::SeparatorText(st.text);
+            ImGui::PopStyleColor();
+        }
+
+        static void BeginFrame() {
+            ImGui_ImplDX11_NewFrame();
+            ImGui_ImplWin32_NewFrame();
+            ImGui::NewFrame();
+
+            ImGui::SetNextWindowPos({ 0, 0 });
+            ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
+            ImGui::Begin(
+                "##Main", nullptr,
+                ImGuiWindowFlags_NoDecoration |
+                ImGuiWindowFlags_NoMove |
+                ImGuiWindowFlags_NoScrollbar
+            );
+        }
+
+        static void EndFrame() {
+            ImGui::End();
+            ImGui::Render();
+        }
+    };
+
+    // ============================================================================
+    //                              DISPLAY CACHE
+    // ============================================================================
+
+    // Formatted once per device poll. Render only reads these buffers.
+    struct DisplayCache {
+        enum Metric : int {
+            BatteryVoltage, InputVoltage, Runtime, OutputVoltage,
+            Frequency, Avr, Sensitivity, Beeper, MetricCount
+        };
+        enum Bar : int { Charge, Load, BarCount };
+
+        Line        metrics[MetricCount]{};
+        Line        bars[BarCount]{};
+        Line        ident[3]{};
+        int         identCount = 0;
+        PowerStatus status = PowerStatus::Disconnected;
+
+        void Rebuild(const UpsState& s) {
+            FillMetrics(s);
+            FillBars(s);
+            FillIdent(s);
+            status = GetPowerStatus(s);
+        }
+
+    private:
+        void Put(
+            Metric id,
+            const char* label,
+            const std::string& text,
+            Health health)
+        {
+            metrics[id].Set(label, text, Theme::ColorOf(health));
+        }
+
+        void Opt(
+            Metric id,
+            const char* label,
+            const std::string& text,
+            bool show,
+            const ImVec4& color = Theme::TEXT_MAIN)
+        {
+            metrics[id].Set(label, text, color, show);
+        }
+
+        void AddIdent(const std::string& text, const ImVec4& color) {
+            ident[identCount++].Set("", text, color);
+        }
+
+        void FillMetrics(const UpsState& s) {
+            const bool liveIn = HasValidInputVoltage(s) && !s.onBattery;
+            const AvrStatus avr = s.ext.hasAvr
+                ? ParseAvrStatus(s.ext.avrRaw, s.ext.avrPowerFlags)
+                : AvrStatus::Unknown;
+
+            Put(BatteryVoltage, "Battery Voltage",
+                Formatter::FormatVoltage(s.batteryVoltage), GetBatteryHealth(s));
+            Put(InputVoltage, "Input Voltage",
+                liveIn ? Formatter::FormatVoltage(s.inputVoltage) : "--",
+                GetInputHealth(s));
+            Put(Runtime, "Est. Runtime",
+                Formatter::FormatRuntime(s.runtimeSeconds), GetRuntimeHealth(s));
+
+            Opt(OutputVoltage, "Output Voltage",
+                Formatter::FormatVoltage(s.ext.outputVoltage), s.ext.hasOutput);
+            Opt(Frequency, "Frequency",
+                Formatter::FormatFrequency(s.ext.inputFrequency), s.ext.hasInputFreq);
+            Opt(Avr, "AVR Status",
+                Formatter::FormatAvrStatus(avr),
+                avr != AvrStatus::Unknown, Theme::ColorOf(avr));
+            Opt(Sensitivity, "Sensitivity",
+                Formatter::SensitivityToString(s.ext.sensitivity),
+                s.ext.hasSensitivity, Theme::TEXT_SUB);
+            Opt(Beeper, "Beeper",
+                Formatter::BeeperToString(s.ext.beeperCode),
+                s.ext.hasBeeper, Theme::TEXT_SUB);
+        }
+
+        void FillBars(const UpsState& s) {
+            bars[Charge].Set("Charge", "",
+                Theme::ColorOf(GetChargeHealth(s)), true, s.GetChargeNormalized());
+            bars[Load].Set("Load", "",
+                Theme::ColorOf(GetLoadHealth(s)), true, s.GetLoadNormalized());
+        }
+
+        void FillIdent(const UpsState& s) {
+            const auto mfr = WideToUtf8(s.manufacturer);
+            const auto prod = WideToUtf8(s.product);
+            const auto ser = WideToUtf8(s.serial);
+
+            identCount = 0;
+            if (!mfr.empty()) {
+                AddIdent(mfr, Theme::TEXT_MAIN);
+            }
+            if (!prod.empty() && prod != mfr) {
+                AddIdent(prod, Theme::TEXT_SUB);
+            }
+            else if (mfr.empty()) {
+                AddIdent("UPS Device", Theme::TEXT_MAIN);
+            }
+            if (!ser.empty()) {
+                AddIdent(ser, Theme::TEXT_DIM);
+            }
+        }
+    };
+
+    // ============================================================================
+    //                              DEVICE VIEW
+    // ============================================================================
+
+    struct DeviceView {
+        DisplayCache cache;
+        Extended     ext{};
+
+        void Poll(UpsDevice& device) {
+            if (GetTickCount64() - lastUpdate_ < Layout::POLL_INTERVAL_MS) {
+                return;
+            }
+
+            const UpsState s = device.ReadState();
+            cache.Rebuild(s);
+            ext = s.ext;
+            lastUpdate_ = GetTickCount64();
+        }
+
+    private:
+        ULONGLONG lastUpdate_ = 0;
+    };
+
+    // ============================================================================
+    //                              CONFIG PANEL
+    // ============================================================================
+
+    // Combo index is local
+    // 
+    // device code = index + offset
+    // 
+    struct ConfigPanel {
+        [[nodiscard]] bool IsOpen() const noexcept { return open_; }
+
+        void Open(const Extended& e) {
+            open_ = true;
+            beeper_.Load(e.hasBeeper, e.beeperCode);
+            sens_.Load(e.hasSensitivity, e.sensitivity);
+        }
+
+        void Draw(UpsDevice& device) {
+            if (UI::WideButton("Back")) {
+                open_ = false;
+                return;
+            }
+
+            UI::Gap(Layout::GAP_CTRL);
+            beeper_.Draw([&](uint8_t v) { device.SetBeeper(v); });
+            sens_.Draw([&](uint8_t v) { device.SetSensitivity(v); });
+        }
+
+    private:
+        struct Setting {
+            const char* label = "";
+            const char* items = "";
+            int         offset = 0;
+            int         sel = 0;
+
+            void Load(bool available, uint8_t code) {
+                if (available) {
+                    sel = std::clamp(static_cast<int>(code) - offset, 0, 2);
+                }
+            }
+
+            template<class Fn>
+            void Draw(Fn&& set) {
+                if (UI::Combo(label, &sel, items)) {
+                    set(static_cast<uint8_t>(sel + offset));
+                }
+            }
+        };
+
+        bool    open_ = false;
+        Setting beeper_{ "Beeper", "Disabled\0Enabled\0Muted\0", 1 };
+        Setting sens_{ "Sensitivity", "Low\0Medium\0High\0", 0 };
+    };
+
+    // ============================================================================
+    //                              MONITOR PANEL
+    // ============================================================================
+
+    struct MonitorPanel {
+        static void Draw(const DeviceView& view, ConfigPanel& config) {
+            UI::DrawMetrics(view.cache.metrics);
+
+            UI::Gap(Layout::GAP_SECTION);
+            UI::DrawBars(view.cache.bars);
+
+            UI::Gap(Layout::GAP_CTRL);
+            if (UI::WideButton("Config")) {
+                config.Open(view.ext);
             }
         }
     };
@@ -169,395 +481,63 @@ namespace Ups {
 
     class MainWindow {
     public:
-        ~MainWindow() { Cleanup(); }
+        ~MainWindow() { Shutdown(); }
 
-        bool Create(HINSTANCE hInst) {
-            hInst_ = hInst;
-
-            WNDCLASSEXW wc = {
-                sizeof(wc),
-                CS_CLASSDC,
-                WndProc,
-                0, 0,
-                hInst,
-                nullptr,
-                LoadCursor(nullptr, IDC_ARROW),
-                nullptr, nullptr,
-                L"UpsMon",
-                nullptr
-            };
-            RegisterClassExW(&wc);
-
-            const int x = GetSystemMetrics(SM_CXSCREEN)
-                - static_cast<int>(Layout::WINDOW_WIDTH)
-                - static_cast<int>(Layout::MARGIN);
-
-            const int y = GetSystemMetrics(SM_CYSCREEN)
-                - static_cast<int>(Layout::WINDOW_HEIGHT)
-                - static_cast<int>(Layout::TASKBAR_H);
-
-            hwnd_ = CreateWindowExW(
-                WS_EX_TOPMOST,
-                wc.lpszClassName,
-                L"UPS",
-                WS_POPUP | WS_VISIBLE,
-                x, y,
-                static_cast<int>(Layout::WINDOW_WIDTH),
-                static_cast<int>(Layout::WINDOW_HEIGHT),
-                nullptr, nullptr,
-                hInst,
-                this
-            );
-
-            if (!hwnd_ || !InitD3D()) return false;
-
-            InitImGui();
-            device_.Connect();
-
-            return true;
-        }
-
-        void Show() const {
-            ShowWindow(hwnd_, SW_SHOWDEFAULT);
-            UpdateWindow(hwnd_);
-        }
-
-        bool ProcessFrame() {
-            MSG msg;
-            while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&msg);
-                DispatchMessage(&msg);
-                if (msg.message == WM_QUIT) return false;
-            }
-
-            if (GetTickCount64() - lastUpdate_ >= 1000) {
-                state_ = device_.ReadState();
-                lastUpdate_ = GetTickCount64();
-            }
-
-            Render();
-            return running_;
-        }
-
-    private:
-        HWND      hwnd_ = nullptr;
-        HINSTANCE hInst_ = nullptr;
-        bool      running_ = true;
-
-        ComPtr<ID3D11Device>           d3dDev_;
-        ComPtr<ID3D11DeviceContext>    d3dCtx_;
-        ComPtr<IDXGISwapChain>         swapChain_;
-        ComPtr<ID3D11RenderTargetView> rtv_;
-
-        UpsDevice device_;
-        UpsState  state_{};
-        ULONGLONG lastUpdate_ = 0;
-
-        bool InitD3D() {
-            DXGI_SWAP_CHAIN_DESC sd{};
-            sd.BufferCount = 2;
-            sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-            sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-            sd.OutputWindow = hwnd_;
-            sd.SampleDesc.Count = 1;
-            sd.Windowed = TRUE;
-            sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-
-            HRESULT hr = D3D11CreateDeviceAndSwapChain(
-                nullptr,
-                D3D_DRIVER_TYPE_HARDWARE,
-                nullptr,
-                0,
-                nullptr, 0,
-                D3D11_SDK_VERSION,
-                &sd,
-                &swapChain_,
-                &d3dDev_,
-                nullptr,
-                &d3dCtx_
-            );
-
-            if (FAILED(hr)) return false;
-
-            CreateRenderTarget();
-            return true;
-        }
-
-        void CreateRenderTarget() {
-            ComPtr<ID3D11Texture2D> buf;
-            if (SUCCEEDED(swapChain_->GetBuffer(0, IID_PPV_ARGS(&buf)))) {
-                d3dDev_->CreateRenderTargetView(buf.Get(), nullptr, &rtv_);
-            }
-        }
-
-        void InitImGui() {
+        bool Init(HWND hwnd, ID3D11Device* device, ID3D11DeviceContext* context) {
             IMGUI_CHECKVERSION();
             ImGui::CreateContext();
             ImGui::GetIO().IniFilename = nullptr;
 
-            auto& s = ImGui::GetStyle();
-            s.WindowRounding = 0.0f;
-            s.FrameRounding = Layout::BAR_ROUNDING;
-            s.CellPadding = { 4, 2 };
-            s.WindowPadding = { 10, 10 };
-            s.ItemSpacing = { 8, Layout::ROW_SPACING };
-
-            s.Colors[ImGuiCol_WindowBg] = Theme::BG_WIN;
-            s.Colors[ImGuiCol_Text] = Theme::TEXT_MAIN;
-
-            ImGui_ImplWin32_Init(hwnd_);
-            ImGui_ImplDX11_Init(d3dDev_.Get(), d3dCtx_.Get());
+            Theme::Apply();
+            ImGui_ImplWin32_Init(hwnd);
+            ImGui_ImplDX11_Init(device, context);
+            device_.Connect();
+            imguiReady_ = true;
+            return true;
         }
 
-        void Render() {
-            ImGui_ImplDX11_NewFrame();
-            ImGui_ImplWin32_NewFrame();
-            ImGui::NewFrame();
-
-            ImGui::SetNextWindowPos({ 0, 0 });
-            ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
-
-            ImGui::Begin(
-                "##Main",
-                nullptr,
-                ImGuiWindowFlags_NoDecoration |
-                ImGuiWindowFlags_NoMove |
-                ImGuiWindowFlags_NoScrollbar
-            );
-
-            DrawHeader();
-            DrawMetrics();
-
-            ImGui::Dummy({ 0, 12 });
-            ImGui::Indent(4);
-
-            UI::ProgressBar(
-                "Charge",
-                state_.GetChargeNormalized(),
-                Theme::GetHealthColor(GetChargeHealth(state_))
-            );
-
-            ImGui::Dummy({ 0, 2 });
-
-            UI::ProgressBar(
-                "Load",
-                state_.GetLoadNormalized(),
-                Theme::GetHealthColor(GetLoadHealth(state_))
-            );
-
-            ImGui::Unindent(4);
-
-            DrawFooter();
-
-            ImGui::End();
-            ImGui::Render();
-
-            static const float clear[] = { 0.0f, 0.0f, 0.0f, 0.0f };
-            d3dCtx_->OMSetRenderTargets(1, rtv_.GetAddressOf(), nullptr);
-            d3dCtx_->ClearRenderTargetView(rtv_.Get(), clear);
-            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-            swapChain_->Present(1, 0);
-        }
-
-        void DrawHeader() {
-            const float avail = ImGui::GetContentRegionAvail().x;
-            ImGui::SetCursorPosX(avail - Layout::CLOSE_SIZE + 10);
-
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Theme::BTN_CLOSE_H);
-
-            if (ImGui::Button("X", { Layout::CLOSE_SIZE, Layout::CLOSE_SIZE })) {
-                running_ = false;
+        void Shutdown() {
+            if (!imguiReady_) {
+                return;
             }
-
-            ImGui::PopStyleColor(2);
-
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 6.0f);
-
-            const PowerStatus status = GetPowerStatus(state_);
-            UI::CenterText(UI::StatusToString(status), Theme::GetStatusColor(status));
-
-            ImGui::Dummy({ 0, 4 });
-            ImGui::PushStyleColor(ImGuiCol_Separator, Theme::SEPARATOR);
-            ImGui::Separator();
-            ImGui::PopStyleColor();
-            ImGui::Dummy({ 0, 8 });
-        }
-
-        void DrawMetrics() {
-            constexpr auto tableFlags =
-                ImGuiTableFlags_SizingStretchProp |
-                ImGuiTableFlags_PadOuterX;
-
-            if (!ImGui::BeginTable("##M", 2, tableFlags)) return;
-
-            ImGui::TableSetupColumn("L", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("R", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-
-            // Battery Voltage
-            UI::MetricRow(
-                "Battery Voltage",
-                Formatter::FormatVoltage(state_.batteryVoltage),
-                Theme::GetHealthColor(GetBatteryHealth(state_))
-            );
-
-            // Input Voltage
-            const std::string inV = (HasValidInputVoltage(state_) && !state_.onBattery)
-                ? Formatter::FormatVoltage(state_.inputVoltage)
-                : "--";
-            UI::MetricRow(
-                "Input Voltage",
-                inV,
-                Theme::GetHealthColor(GetInputHealth(state_))
-            );
-
-            // Runtime
-            UI::MetricRow(
-                "Est. Runtime",
-                Formatter::FormatRuntime(state_.runtimeSeconds),
-                Theme::GetHealthColor(GetRuntimeHealth(state_))
-            );
-
-            // Output Voltage
-            if (state_.ext.hasOutput) {
-                UI::MetricRow(
-                    "Output Voltage",
-                    Formatter::FormatVoltage(state_.ext.outputVoltage),
-                    Theme::TEXT_MAIN
-                );
-            }
-
-            // Frequency
-            if (state_.ext.hasInputFreq) {
-                UI::MetricRow(
-                    "Frequency",
-                    Formatter::FormatFrequency(state_.ext.inputFrequency),
-                    Theme::TEXT_MAIN
-                );
-            }
-
-            // AVR Status
-            if (state_.ext.hasAvr) {
-                const AvrStatus avr = ParseAvrStatus(
-                    state_.ext.avrRaw,
-                    state_.ext.avrPowerFlags
-                );
-
-                if (avr != AvrStatus::Unknown) {
-                    const ImVec4 c = (avr == AvrStatus::Normal)
-                        ? Theme::COL_OK
-                        : Theme::COL_INFO;
-                    UI::MetricRow("AVR Status", Formatter::FormatAvrStatus(avr), c);
-                }
-            }
-
-            // Sensitivity
-            if (state_.ext.hasSensitivity) {
-                UI::MetricRow(
-                    "Sensitivity",
-                    Formatter::SensitivityToString(state_.ext.sensitivity),
-                    Theme::TEXT_SUB
-                );
-            }
-
-            // Beeper
-            if (state_.ext.hasBeeper) {
-                UI::MetricRow(
-                    "Beeper",
-                    Formatter::BeeperToString(state_.ext.beeperCode),
-                    Theme::TEXT_SUB
-                );
-            }
-
-            ImGui::EndTable();
-        }
-
-        void DrawFooter() {
-            const float availY = ImGui::GetContentRegionAvail().y;
-            const float spacing = (availY > 60.0f) ? availY - 60.0f : 12.0f;
-            ImGui::Dummy({ 0, spacing });
-
-            ImGui::PushStyleColor(ImGuiCol_Separator, Theme::SEPARATOR);
-            ImGui::Separator();
-            ImGui::PopStyleColor();
-            ImGui::Dummy({ 0, 6 });
-
-            const std::string man = WideToUtf8(state_.manufacturer);
-            const std::string prd = WideToUtf8(state_.product);
-            const std::string ser = WideToUtf8(state_.serial);
-
-            if (!man.empty()) {
-                UI::CenterText(man.c_str(), Theme::TEXT_MAIN);
-            }
-
-            if (!prd.empty() && prd != man) {
-                UI::CenterText(prd.c_str(), Theme::TEXT_SUB);
-            }
-            else if (man.empty()) {
-                UI::CenterText("UPS Device", Theme::TEXT_MAIN);
-            }
-
-            if (!ser.empty()) {
-                UI::CenterText(ser.c_str(), Theme::TEXT_DIM);
-            }
-        }
-
-        void Cleanup() {
             ImGui_ImplDX11_Shutdown();
             ImGui_ImplWin32_Shutdown();
             ImGui::DestroyContext();
-
-            if (hwnd_) DestroyWindow(hwnd_);
-            UnregisterClassW(L"UpsMon", hInst_);
+            imguiReady_ = false;
         }
 
-        static LRESULT CALLBACK WndProc(
-            HWND hWnd,
-            UINT msg,
-            WPARAM wp,
-            LPARAM lp)
-        {
-            if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wp, lp)) {
-                return 1;
+        void Tick() {
+            view_.Poll(device_);
+            UI::BeginFrame();
+            Draw();
+            UI::EndFrame();
+        }
+
+        [[nodiscard]] bool IsRunning() const { return running_; }
+        void RequestClose() { running_ = false; }
+
+    private:
+        bool        imguiReady_ = false;
+        bool        running_ = true;
+        UpsDevice   device_;
+        DeviceView  view_{};
+        ConfigPanel config_{};
+
+        void Draw() {
+            if (UI::CloseButton()) {
+                running_ = false;
             }
 
-            if (msg == WM_NCCREATE) {
-                auto* cs = reinterpret_cast<CREATESTRUCT*>(lp);
-                SetWindowLongPtrW(
-                    hWnd,
-                    GWLP_USERDATA,
-                    reinterpret_cast<LONG_PTR>(cs->lpCreateParams)
-                );
+            UI::StatusHeader(view_.cache.status);
+
+            if (config_.IsOpen()) {
+                config_.Draw(device_);
+            }
+            else {
+                MonitorPanel::Draw(view_, config_);
             }
 
-            auto* self = reinterpret_cast<MainWindow*>(
-                GetWindowLongPtrW(hWnd, GWLP_USERDATA)
-                );
-
-            switch (msg) {
-            case WM_NCHITTEST: {
-                POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-                ScreenToClient(hWnd, &pt);
-
-                const bool inCaption = pt.y < 50 &&
-                    pt.x < Layout::WINDOW_WIDTH - 40;
-                return inCaption ? HTCAPTION : HTCLIENT;
-            }
-
-            case WM_SIZE:
-                if (self && self->d3dDev_ && wp != SIZE_MINIMIZED) {
-                    self->rtv_.Reset();
-                    self->swapChain_->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0);
-                    self->CreateRenderTarget();
-                }
-                return 0;
-
-            case WM_DESTROY:
-                PostQuitMessage(0);
-                return 0;
-            }
-
-            return DefWindowProcW(hWnd, msg, wp, lp);
+            UI::DrawFooter(view_.cache.ident, view_.cache.identCount);
         }
     };
 

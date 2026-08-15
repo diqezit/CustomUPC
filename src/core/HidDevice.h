@@ -550,6 +550,13 @@ namespace Ups {
             return true;
         }
 
+        bool WriteByte(ReportIndex idx, uint8_t value) {
+            if (!ReadFeature(Rid(idx))) return false;
+
+            buf_[1] = value;
+            return hid_send_feature_report(dev_, buf_.data(), buf_.size()) >= 0;
+        }
+
         bool ReadFrequency(const HidValueInfo& info, float& out) {
             if (!info.IsValid() || !ReadFeature(info.reportId)) return false;
 

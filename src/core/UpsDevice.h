@@ -134,6 +134,16 @@ namespace Ups {
             return s;
         }
 
+        bool SetBeeper(uint8_t code) {
+            if (!dev_) return false;
+            return hid_.WriteByte(IDX_BEEPER, code);
+        }
+
+        bool SetSensitivity(uint8_t code) {
+            if (!dev_) return false;
+            return hid_.WriteByte(IDX_SENSITIVITY, code);
+        }
+
     private:
         hid_device* dev_ = nullptr;
         uint16_t    vid_ = 0;
@@ -232,7 +242,7 @@ namespace Ups {
             const auto got = [&](bool done) {
                 if (done) ++ok;
                 return done;
-            };
+                };
 
             // Status
             if (got(ReadReport(IDX_STATUS))) {
@@ -368,7 +378,7 @@ namespace Ups {
 
             const auto has = [&](auto flag) {
                 return Flag::Has(s.rawFlags, flag);
-            };
+                };
 
             if (!input_.IsDischarging()) {
                 s.charging = has(Flag::CHARGING);
