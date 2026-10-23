@@ -7,7 +7,6 @@
 
 #include <hidapi.h>
 
-#include <vector>
 #include <string>
 #include <algorithm>
 
@@ -20,8 +19,6 @@ namespace Ups {
     namespace DeviceConfig {
         inline constexpr int    MAX_FAILURES = 3;
         inline constexpr int    EXTENDED_INTERVAL = 5;
-        inline constexpr int    DRAIN_READS = 6;
-        inline constexpr int    READ_TIMEOUT_MS = 20;
         inline constexpr size_t STRING_LEN = 128;
     }
 
@@ -72,10 +69,13 @@ namespace Ups {
                 return false;
             }
 
-            hid_.Open(dev_, foundPath);
-
-            const ModelProfile& p = hid_.Profile();
-            codec_.SetInfo(p.input, p.battery, p.charge);
+            if (!hid_.Open(dev_, foundPath)) {
+                LOG_ERROR("HID descriptor parse failed");
+                hid_close(dev_);
+                dev_ = nullptr;
+                ResetIdentity();
+                return false;
+            }
 
             ReadStrings();
             ResetSession();
@@ -109,9 +109,10 @@ namespace Ups {
                 return s;
             }
 
-            DrainInput();
             const int ok = ReadCoreReports(s);
 
+            // Settings and slow-changing values do not need a per second read,
+            // so they share the slower extended path
             if (pollCount_ % DeviceConfig::EXTENDED_INTERVAL == 0) {
                 ReadExtendedReports(s);
             }
@@ -125,7 +126,6 @@ namespace Ups {
 
             if (ok > 0) failCount_ = 0;
 
-            input_.ApplyTo(s);
             FinalizeState(s);
 
             state_ = s;
@@ -134,14 +134,38 @@ namespace Ups {
             return s;
         }
 
+        // Successful writes update the cached state so the UI
+        // does not wait for the next extended poll
         bool SetBeeper(uint8_t code) {
-            if (!dev_) return false;
-            return hid_.WriteByte(IDX_BEEPER, code);
+            if (!dev_ || !hid_.WriteValue(hid_.Profile().vBeeper, code)) {
+                return false;
+            }
+            SetExtBeeper(state_.ext, code);
+            return true;
         }
 
         bool SetSensitivity(uint8_t code) {
-            if (!dev_) return false;
-            return hid_.WriteByte(IDX_SENSITIVITY, code);
+            if (!dev_ || !hid_.WriteValue(hid_.Profile().vSensitivity, code)) {
+                return false;
+            }
+            SetExtSensitivity(state_.ext, code);
+            return true;
+        }
+
+        bool SetLowTransfer(uint16_t volts) {
+            if (!dev_ || !hid_.WriteValue(hid_.Profile().vLowTransfer, volts)) {
+                return false;
+            }
+            SetExtLowTransfer(state_.ext, volts);
+            return true;
+        }
+
+        bool SetHighTransfer(uint16_t volts) {
+            if (!dev_ || !hid_.WriteValue(hid_.Profile().vHighTransfer, volts)) {
+                return false;
+            }
+            SetExtHighTransfer(state_.ext, volts);
+            return true;
         }
 
     private:
@@ -150,9 +174,7 @@ namespace Ups {
         uint16_t    pid_ = 0;
 
         HidReportReader    hid_;
-        VoltageCodec       codec_;
         RuntimeSmoother    runtime_;
-        InputReportTracker input_;
         UpsState           state_{};
 
         std::wstring manufacturer_;
@@ -172,7 +194,6 @@ namespace Ups {
 
         void ResetSession() noexcept {
             state_ = {};
-            input_.Reset();
             runtime_.Reset();
 
             pollCount_ = 0;
@@ -196,10 +217,6 @@ namespace Ups {
             ReadString(hid_get_serial_number_string, serial_);
         }
 
-        bool ReadReport(ReportIndex idx, size_t minLen = 0) {
-            return hid_.ReadFeature(hid_.Rid(idx)) && hid_.Size() >= minLen;
-        }
-
         // keeps shown runtime below point where the UPS cuts power
         void ApplyRuntime(UpsState& s, int seconds) {
             const int smoothed = runtime_.Update(seconds);
@@ -207,31 +224,6 @@ namespace Ups {
                 0,
                 smoothed - Config::RUNTIME_RESERVE_MINUTES * 60
             );
-        }
-
-        // input reports queue up between polls 
-        // and stale entries would mask a power event
-        void DrainInput() {
-            std::vector<uint8_t> b(
-                std::max(hid_.InputLen(), HidReportConfig::MIN_FEATURE_LEN)
-            );
-
-            for (int i = 0; i < DeviceConfig::DRAIN_READS; ++i) {
-                const int r = hid_.ReadInput(
-                    b.data(),
-                    b.size(),
-                    DeviceConfig::READ_TIMEOUT_MS
-                );
-
-                if (r <= 0) break;
-                input_.Process(b[0], b.data(), r);
-            }
-        }
-
-        template <class Setter>
-        void ReadExtByte(ReportIndex idx, Setter set, UpsState& s) {
-            uint8_t raw = 0;
-            if (hid_.ReadByte(idx, raw)) set(s.ext, raw);
         }
 
         int ReadCoreReports(UpsState& s) {
@@ -244,41 +236,44 @@ namespace Ups {
                 return done;
                 };
 
-            // Status
-            if (got(ReadReport(IDX_STATUS))) {
-                s.rawFlags = hid_.Data()[1];
+            // Power status is read from the descriptor fields themselves.
+            if (got(hid_.ReadValue(p.vAcPresent, v))) {
+                s.acPresent = v != 0.0f;
+            }
+            if (got(hid_.ReadValue(p.vDischarging, v))) {
+                s.onBattery = v != 0.0f;
+            }
+            if (got(hid_.ReadValue(p.vCharging, v))) {
+                s.charging = v != 0.0f;
+            }
+            if (got(hid_.ReadValue(p.vOverload, v))) {
+                s.overload = v != 0.0f;
+            }
+            if (got(hid_.ReadValue(p.vBadBattery, v))) {
+                s.badBattery = v != 0.0f;
             }
 
             // Load
-            const size_t len = hid_.Size();
-            if (got(hid_.ReadMetric(p.vLoad, IDX_TELEMETRY, v,
-                [len](const uint8_t* b) {
-                    return len >= 3 ? static_cast<float>(b[2]) : 0.0f;
-                })))
-            {
+            if (got(hid_.ReadValue(p.vLoad, v))) {
                 s.loadPercent = DataUtils::ClampPercent(
                     static_cast<int>(v + 0.5f)
                 );
             }
 
             // Battery Voltage
-            if (got(hid_.ReadMetric(p.vBattery, IDX_BATT_V, v,
-                [this](const uint8_t* b) { return codec_.DecodeBattery(b); })))
-            {
+            if (got(hid_.ReadValue(p.vBattery, v))) {
                 if (Validators::IsValidBatteryVoltage(v)) {
                     s.batteryVoltage = v;
                 }
             }
 
             // Input Voltage
-            // 
-            // firmware reports garbage while on battery
-            // so the last mains reading is kept instead
             //
-            if (got(hid_.ReadMetric(p.vInput, IDX_INPUT_V, v,
-                [this](const uint8_t* b) { return codec_.DecodeInput(b); })))
-            {
-                if (!input_.IsDischarging() &&
+            // On battery / on AC the firmware can report garbage for input voltage,
+            // so the last valid AC reading is kept instead of showing a false value
+            //
+            if (got(hid_.ReadValue(p.vInput, v))) {
+                if (!s.onBattery &&
                     Validators::IsValidInputVoltage(v))
                 {
                     s.inputVoltage = v;
@@ -286,35 +281,18 @@ namespace Ups {
             }
 
             // Charge
-            // 
-            // interrupt reports are more accurate and win when present
-            //
-
-            if (got(hid_.ReadMetric(p.vCharge, IDX_CHARGE, v,
-                [this](const uint8_t* b) {
-                    return codec_.HasDynamicCharge()
-                        ? codec_.DecodeCharge(b)
-                        : static_cast<float>(b[1]);
-                })))
-            {
-                if (!input_.HasCharge()) {
-                    s.chargePercent = DataUtils::ClampPercent(v);
-                }
+            if (got(hid_.ReadValue(p.vCharge, v))) {
+                s.chargePercent = DataUtils::ClampPercent(v);
             }
 
             // Runtime
-            // 
-            // spec says seconds (unit 0x1001) while APC models leave unit empty and send minute
+            //
+            // The official driver applies the HID unit; this field is seconds.
             //
             if (got(hid_.ReadValue(p.vRuntime, v))) {
-                const bool inSeconds = p.vRuntime.unit == HidExtra::UNIT_SECONDS;
-                ApplyRuntime(
-                    s,
-                    static_cast<int>(inSeconds ? v + 0.5f : v * 60.0f + 0.5f)
-                );
-            }
-            else if (got(ReadReport(IDX_RUNTIME, 3))) {
-                ApplyRuntime(s, DataUtils::ReadLE16(hid_.Data() + 1));
+                if (p.vRuntime.unit == HidExtra::UNIT_SECONDS) {
+                    ApplyRuntime(s, static_cast<int>(v + 0.5f));
+                }
             }
 
             return ok;
@@ -324,46 +302,32 @@ namespace Ups {
             const ModelProfile& p = hid_.Profile();
             float v = 0.0f;
 
-            // Output Voltage
-            if (hid_.ReadMetric(p.vOutput, IDX_OUT_VOLT, v,
-                [](const uint8_t* b) {
-                    return FrequencyDecoder::DecodeOutputVoltage(b[1]);
-                }))
-            {
+            // Output Voltage is only present when the descriptor exposes an
+            // Output collection.
+            if (hid_.ReadValue(p.vOutput, v)) {
                 if (Validators::IsValidOutputVoltage(v)) {
                     SetExtOutput(s.ext, v);
                 }
             }
 
-            // frequency report covers both lines
-            // 
-            // but mirroring it onto input side only holds while mains is present
-            ///
-
-            if (ReadReport(IDX_FREQUENCY)) {
-                v = FrequencyDecoder::Decode(hid_.Data(), false);
-                if (Validators::IsValidFrequency(v)) {
-                    SetExtOutputFreq(s.ext, v);
-                    if (s.inputVoltage > 0) {
-                        SetExtInputFreq(s.ext, v);
-                    }
-                }
-            }
-
-            // Dedicated frequency fields override the generic report
-            if (hid_.ReadFrequency(p.inputFreq, v))  SetExtInputFreq(s.ext, v);
-            if (hid_.ReadFrequency(p.outputFreq, v)) SetExtOutputFreq(s.ext, v);
-
             // AVR
-            if (ReadReport(IDX_AVR, 4)) {
-                SetExtAvr(s.ext, hid_.Data()[1], hid_.Data()[3]);
+            if (hid_.ReadValue(p.vAvr, v)) {
+                SetExtAvr(s.ext, static_cast<uint8_t>(v));
             }
 
-            // Single-byte settings
-            ReadExtByte(IDX_LOW_BATT, SetExtLowBatt, s);
-            ReadExtByte(IDX_SENSITIVITY, SetExtSensitivity, s);
-            ReadExtByte(IDX_BEEPER, SetExtBeeper, s);
-            ReadExtByte(IDX_SELF_TEST, SetExtSelfTest, s);
+            // Descriptor-bound settings
+            if (hid_.ReadValue(p.vSensitivity, v)) {
+                SetExtSensitivity(s.ext, static_cast<uint8_t>(v));
+            }
+            if (hid_.ReadValue(p.vBeeper, v)) {
+                SetExtBeeper(s.ext, static_cast<uint8_t>(v));
+            }
+            if (hid_.ReadValue(p.vLowTransfer, v)) {
+                SetExtLowTransfer(s.ext, static_cast<uint16_t>(v + 0.5f));
+            }
+            if (hid_.ReadValue(p.vHighTransfer, v)) {
+                SetExtHighTransfer(s.ext, static_cast<uint16_t>(v + 0.5f));
+            }
         }
 
         void FinalizeState(UpsState& s) {
@@ -376,19 +340,6 @@ namespace Ups {
                 dateParsed_ = true;
             }
 
-            const auto has = [&](auto flag) {
-                return Flag::Has(s.rawFlags, flag);
-                };
-
-            if (!input_.IsDischarging()) {
-                s.charging = has(Flag::CHARGING);
-                s.onBattery = has(Flag::DISCHARGING);
-                s.acPresent = has(Flag::AC_PRESENT) || s.charging;
-            }
-
-            s.lowBattery = has(Flag::LOW_BATTERY);
-            s.overload = has(Flag::OVERLOAD);
-            s.badBattery = has(Flag::BAD_BATTERY);
             s.connected = true;
         }
     };

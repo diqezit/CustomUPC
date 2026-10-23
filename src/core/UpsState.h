@@ -18,7 +18,6 @@ namespace Ups {
 
     namespace Config {
         inline constexpr int RUNTIME_RESERVE_MINUTES = 2;
-        inline constexpr int UPDATE_INTERVAL_MS = 1000;
     }
 
     // ============================================================================
@@ -33,28 +32,17 @@ namespace Ups {
 
         // Usages
         inline constexpr uint16_t VOLTAGE = 0x30;
-        inline constexpr uint16_t CONFIG_VOLTAGE = 0x40;
-        inline constexpr uint16_t FREQ_INPUT = 0x37;
-        inline constexpr uint16_t FREQ_OUTPUT = 0x38;
-        inline constexpr uint16_t FREQUENCY = 0x32;
+        inline constexpr uint16_t LOW_VOLTAGE_TRANSFER = 0x53;
+        inline constexpr uint16_t HIGH_VOLTAGE_TRANSFER = 0x54;
         inline constexpr uint16_t AUDIBLE_ALARM = 0x5A;
         inline constexpr uint16_t REMAINING_CAPACITY = 0x66;
-        inline constexpr uint16_t CAPACITY_LIMIT = 0x2A;
         inline constexpr uint16_t AVR_STATUS = 0x60;
         inline constexpr uint16_t SENSITIVITY = 0x61;
-
-        // Report IDs
-        inline constexpr uint8_t RID_STATUS = 0x01;
-        inline constexpr uint8_t RID_FREQUENCY = 0x02;
-        inline constexpr uint8_t RID_OUT_VOLT = 0x03;
-        inline constexpr uint8_t RID_POWER_STATE = 0x06;
-        inline constexpr uint8_t RID_VOLTAGE = 0x07;
-        inline constexpr uint8_t RID_TELEMETRY = 0x09;
-        inline constexpr uint8_t RID_BEEPER = 0x0B;
-        inline constexpr uint8_t RID_INPUT_CHARGE = 0x0C;
-        inline constexpr uint8_t RID_CHARGE = 0x0D;
-        inline constexpr uint8_t RID_SELFTEST = 0x18;
-        inline constexpr uint8_t RID_RUNTIME = 0x74;
+        inline constexpr uint16_t CHARGING = 0x44;
+        inline constexpr uint16_t DISCHARGING = 0x45;
+        inline constexpr uint16_t AC_PRESENT = 0xD0;
+        inline constexpr uint16_t OVERLOAD = 0x65;
+        inline constexpr uint16_t NEED_REPLACEMENT = 0x4B;
     }
 
     // ============================================================================
@@ -72,28 +60,6 @@ namespace Ups {
     }
 
     // ============================================================================
-    //                             STATUS FLAGS
-    // ============================================================================
-
-    namespace Flag {
-        inline constexpr uint8_t CHARGING = 0x01;
-        inline constexpr uint8_t DISCHARGING = 0x02;
-        inline constexpr uint8_t LOW_BATTERY = 0x04;
-        inline constexpr uint8_t AC_PRESENT = 0x08;
-        inline constexpr uint8_t BAD_BATTERY = 0x10;
-        inline constexpr uint8_t OVERLOAD = 0x20;
-
-        [[nodiscard]] constexpr bool Has(uint8_t flags, uint8_t mask) noexcept {
-            return (flags & mask) != 0;
-        }
-    }
-
-    namespace InputFlag {
-        inline constexpr uint8_t DISCHARGING = 0x10;
-        inline constexpr uint8_t CHARGING = 0x08;
-    }
-
-    // ============================================================================
     //                             CODE CONSTANTS
     // ============================================================================
 
@@ -101,10 +67,6 @@ namespace Ups {
         inline constexpr uint8_t DISABLED = 0x01;
         inline constexpr uint8_t ENABLED = 0x02;
         inline constexpr uint8_t MUTED = 0x03;
-
-        [[nodiscard]] constexpr bool IsOn(uint8_t c) noexcept {
-            return c == ENABLED;
-        }
     }
 
     namespace SensitivityCode {
@@ -135,14 +97,6 @@ namespace Ups {
         BadBattery
     };
 
-    enum class BatteryLevel : uint8_t {
-        Full,
-        Normal,
-        Low,
-        Critical,
-        Empty
-    };
-
     enum class AvrStatus : uint8_t {
         Normal,
         Boost,
@@ -158,7 +112,6 @@ namespace Ups {
         // Battery voltage
         inline constexpr float BATT_V_MIN = 5.0f;
         inline constexpr float BATT_V_MAX = 16.0f;
-        inline constexpr float BATT_FULL = 13.20f;
         inline constexpr float BATT_WARN = 11.50f;
         inline constexpr float BATT_CRIT = 10.60f;
 
@@ -171,10 +124,6 @@ namespace Ups {
         // Output voltage
         inline constexpr float OUTPUT_V_MIN = 100.0f;
         inline constexpr float OUTPUT_V_MAX = 260.0f;
-
-        // Frequency
-        inline constexpr float FREQ_MIN = 45.0f;
-        inline constexpr float FREQ_MAX = 65.0f;
 
         // Thresholds
         inline constexpr float CHARGE_CRIT = 20.0f;
@@ -204,50 +153,26 @@ namespace Ups {
     };
 
     // ============================================================================
-    //                              HID VALUE INFO
-    // ============================================================================
-
-    struct HidValueInfo {
-        uint8_t  reportId = 0;
-        uint16_t usage = 0;
-        uint16_t bitSize = 0;
-        uint32_t unit = 0;
-        uint32_t unitExp = 0;
-        long     logicalMax = 0;
-
-        [[nodiscard]] constexpr bool IsValid() const noexcept {
-            return reportId != 0;
-        }
-
-        [[nodiscard]] constexpr bool Is16bit() const noexcept {
-            return bitSize > 8;
-        }
-    };
-
-    // ============================================================================
     //                            EXTENDED STATE
     // ============================================================================
 
     struct Extended {
         float outputVoltage = 0;
-        float inputFrequency = 0;
-        float outputFrequency = 0;
 
         uint8_t sensitivity = 0xFF;
-        uint8_t selfTestResult = 0xFF;
         uint8_t beeperCode = 0xFF;
-        uint8_t lowBatteryThreshold = 0;
         uint8_t avrRaw = 0;
-        uint8_t avrPowerFlags = 0;
+
+        // Transfer thresholds are whole volts on this device
+        uint16_t lowTransferVoltage = 0;
+        uint16_t highTransferVoltage = 0;
 
         bool hasOutput = false;
-        bool hasInputFreq = false;
-        bool hasOutputFreq = false;
         bool hasSensitivity = false;
-        bool hasSelfTest = false;
         bool hasBeeper = false;
-        bool hasLowBatteryThreshold = false;
         bool hasAvr = false;
+        bool hasLowTransfer = false;
+        bool hasHighTransfer = false;
 
         constexpr void Reset() noexcept {
             *this = Extended{};
@@ -268,12 +193,9 @@ namespace Ups {
         bool connected = false;
         bool onBattery = false;
         bool charging = false;
-        bool lowBattery = false;
         bool overload = false;
         bool badBattery = false;
         bool acPresent = false;
-
-        uint8_t rawFlags = 0;
 
         std::wstring manufacturer;
         std::wstring product;

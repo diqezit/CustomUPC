@@ -10,7 +10,6 @@
 #include <hidpi.h>
 
 #include <vector>
-#include <array>
 #include <string>
 #include <algorithm>
 
@@ -25,7 +24,6 @@ namespace Ups {
     namespace HidReportConfig {
         inline constexpr size_t MIN_FEATURE_LEN = 2;
         inline constexpr size_t DEFAULT_FEATURE_LEN = 64;
-        inline constexpr size_t DEFAULT_INPUT_LEN = 5;
         inline constexpr int    MAX_COLLECTION_DEPTH = 32;
     }
 
@@ -87,23 +85,6 @@ namespace Ups {
     //                              MODEL PROFILE
     // ============================================================================
 
-    enum ReportIndex : size_t {
-        IDX_STATUS,
-        IDX_TELEMETRY,
-        IDX_BATT_V,
-        IDX_INPUT_V,
-        IDX_CHARGE,
-        IDX_RUNTIME,
-        IDX_OUT_VOLT,
-        IDX_FREQUENCY,
-        IDX_AVR,
-        IDX_LOW_BATT,
-        IDX_SENSITIVITY,
-        IDX_BEEPER,
-        IDX_SELF_TEST,
-        REPORT_COUNT
-    };
-
     namespace HidCollection {
         inline constexpr uint16_t BATTERY = 0x12;
         inline constexpr uint16_t INPUT = 0x1A;
@@ -116,7 +97,7 @@ namespace Ups {
         inline constexpr uint32_t UNIT_SECONDS = 0x1001;    // HID unit s
     }
 
-    // Addresses HID value for fields whose bit offset cannot be guessed
+    // Addresses a HID field by the descriptor data, never by a byte offset.
     struct ValueRef {
         uint8_t  reportId = 0;
         uint16_t page = 0;
@@ -129,29 +110,15 @@ namespace Ups {
     };
 
     struct ModelProfile {
-        std::array<uint8_t, REPORT_COUNT> discoveredIds{};
-        HidValueInfo input, battery, charge, inputFreq, outputFreq;
         ValueRef vInput, vOutput, vBattery, vCharge, vLoad, vRuntime;
+        ValueRef vCharging, vDischarging, vAcPresent, vAvr;
+        ValueRef vOverload, vBadBattery;
+        ValueRef vBeeper, vSensitivity;
+
+        // These are writable settings, not live measurements
+        ValueRef vLowTransfer, vHighTransfer;
+
         size_t featureLen = HidReportConfig::DEFAULT_FEATURE_LEN;
-        size_t inputLen = HidReportConfig::DEFAULT_INPUT_LEN;
-
-        static constexpr std::array<uint8_t, REPORT_COUNT> FALLBACKS = {
-            HidUsage::RID_STATUS,
-            HidUsage::RID_TELEMETRY,
-            HidUsage::RID_VOLTAGE,
-            0,
-            HidUsage::RID_CHARGE,
-            HidUsage::RID_RUNTIME,
-            HidUsage::RID_OUT_VOLT,
-            HidUsage::RID_FREQUENCY,
-            0, 0, 0,
-            HidUsage::RID_BEEPER,
-            HidUsage::RID_SELFTEST
-        };
-
-        [[nodiscard]] uint8_t GetRID(ReportIndex i) const noexcept {
-            return discoveredIds[i] ? discoveredIds[i] : FALLBACKS[i];
-        }
     };
 
     // ============================================================================
@@ -190,7 +157,6 @@ namespace Ups {
             }
 
             p.featureLen = caps.FeatureReportByteLength;
-            p.inputLen = caps.InputReportByteLength;
 
             LOG_INFO(
                 "HID Caps: UsagePage=0x" + DataUtils::Hex16(caps.UsagePage) +
@@ -212,81 +178,17 @@ namespace Ups {
     private:
         using NodeList = std::vector<HIDP_LINK_COLLECTION_NODE>;
 
-        struct SimpleUsageEntry {
-            uint16_t    page;
-            uint16_t    usage;
-            ReportIndex idx;
-        };
+        static void Bind(const HIDP_VALUE_CAPS& v, ValueRef* ref) {
+            if (!ref) return;
 
-        static constexpr std::array<SimpleUsageEntry, 4> SIMPLE_USAGES = { {
-            { HidUsage::PAGE_POWER_DEVICE,   HidUsage::AUDIBLE_ALARM,  IDX_BEEPER      },
-            { HidUsage::PAGE_BATTERY_SYSTEM, HidUsage::CAPACITY_LIMIT, IDX_LOW_BATT    },
-            { HidUsage::PAGE_APC_VENDOR,     HidUsage::AVR_STATUS,     IDX_AVR         },
-            { HidUsage::PAGE_APC_VENDOR,     HidUsage::SENSITIVITY,    IDX_SENSITIVITY },
-        } };
-
-        static void MarkDiscovered(ModelProfile& p, ReportIndex idx, uint8_t rid) noexcept {
-            p.discoveredIds[idx] = rid;
-        }
-
-        static bool TryMarkSimpleUsage(
-            uint16_t page,
-            uint16_t usage,
-            uint8_t reportId,
-            ModelProfile& p)
-        {
-            for (const auto& e : SIMPLE_USAGES) {
-                if (e.page == page && e.usage == usage) {
-                    MarkDiscovered(p, e.idx, reportId);
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        static void Bind(
-            const HIDP_VALUE_CAPS& v,
-            ReportIndex idx,
-            ModelProfile& p,
-            ValueRef* ref,
-            HidValueInfo* info = nullptr)
-        {
-            const uint8_t  reportId = v.ReportID;
-            const uint16_t usage = v.NotRange.Usage;
-            const uint32_t units = v.Units;
-
-            const HidValueInfo vi{
-                reportId,
-                usage,
-                v.BitSize,
-                units,
-                v.UnitsExp,
-                v.LogicalMax
+            *ref = ValueRef{
+                v.ReportID,
+                v.UsagePage,
+                v.NotRange.Usage,
+                v.LinkCollection,
+                v.Units,
+                ComputeScale(v.Units, v.UnitsExp)
             };
-
-            if (ref) {
-                *ref = ValueRef{
-                    reportId,
-                    v.UsagePage,
-                    usage,
-                    v.LinkCollection,
-                    units,
-                    ComputeScale(vi)
-                };
-            }
-
-            if (info) *info = vi;
-
-            MarkDiscovered(p, idx, reportId);
-        }
-
-        static void BindInfoIfEmpty(
-            HidValueInfo& target,
-            const HIDP_VALUE_CAPS& v,
-            ReportIndex idx,
-            ModelProfile& p)
-        {
-            if (!target.IsValid()) Bind(v, idx, p, nullptr, &target);
         }
 
         static NodeList GetCollectionNodes(
@@ -364,7 +266,15 @@ namespace Ups {
         {
             const uint16_t usage = v.NotRange.Usage;
 
-            if (TryMarkSimpleUsage(v.UsagePage, usage, v.ReportID, p)) return;
+            if (v.UsagePage == HidUsage::PAGE_APC_VENDOR) {
+                if (usage == HidUsage::AVR_STATUS) {
+                    Bind(v, &p.vAvr);
+                }
+                else if (usage == HidUsage::SENSITIVITY) {
+                    Bind(v, &p.vSensitivity);
+                }
+                return;
+            }
 
             switch (v.UsagePage) {
             case HidUsage::PAGE_POWER_DEVICE:
@@ -374,24 +284,23 @@ namespace Ups {
                     break;
 
                 case HidExtra::PERCENT_LOAD:
-                    Bind(v, IDX_TELEMETRY, p, &p.vLoad);
+                    Bind(v, &p.vLoad);
                     break;
 
-                case HidUsage::CONFIG_VOLTAGE:
-
-                    // ConfigVoltage normally holds nominal mains voltage
-                    if (!p.vBattery.IsValid() && v.LogicalMax <= 20) {
-                        Bind(v, IDX_BATT_V, p, nullptr, &p.battery);
-                    }
+                case HidUsage::AUDIBLE_ALARM:
+                    Bind(v, &p.vBeeper);
                     break;
 
-                case HidUsage::FREQ_INPUT:
-                    Bind(v, IDX_FREQUENCY, p, nullptr, &p.inputFreq);
+                case HidUsage::LOW_VOLTAGE_TRANSFER:
+                    Bind(v, &p.vLowTransfer);
                     break;
 
-                case HidUsage::FREQ_OUTPUT:
-                case HidUsage::FREQUENCY:
-                    BindInfoIfEmpty(p.outputFreq, v, IDX_FREQUENCY, p);
+                case HidUsage::HIGH_VOLTAGE_TRANSFER:
+                    Bind(v, &p.vHighTransfer);
+                    break;
+
+                case HidUsage::OVERLOAD:
+                    Bind(v, &p.vOverload);
                     break;
                 }
                 break;
@@ -399,11 +308,27 @@ namespace Ups {
             case HidUsage::PAGE_BATTERY_SYSTEM:
                 switch (usage) {
                 case HidUsage::REMAINING_CAPACITY:
-                    Bind(v, IDX_CHARGE, p, &p.vCharge, &p.charge);
+                    Bind(v, &p.vCharge);
                     break;
 
                 case HidExtra::RUNTIME_TO_EMPTY:
-                    Bind(v, IDX_RUNTIME, p, &p.vRuntime);
+                    Bind(v, &p.vRuntime);
+                    break;
+
+                case HidUsage::CHARGING:
+                    if (!p.vCharging.IsValid()) Bind(v, &p.vCharging);
+                    break;
+
+                case HidUsage::DISCHARGING:
+                    if (!p.vDischarging.IsValid()) Bind(v, &p.vDischarging);
+                    break;
+
+                case HidUsage::AC_PRESENT:
+                    if (!p.vAcPresent.IsValid()) Bind(v, &p.vAcPresent);
+                    break;
+
+                case HidUsage::NEED_REPLACEMENT:
+                    Bind(v, &p.vBadBattery);
                     break;
                 }
                 break;
@@ -417,21 +342,18 @@ namespace Ups {
         {
             switch (ResolveCollection(nodes, v.LinkCollection)) {
             case HidCollection::OUTPUT:
-                Bind(v, IDX_OUT_VOLT, p, &p.vOutput);
+                Bind(v, &p.vOutput);
                 return;
 
             case HidCollection::BATTERY:
-                Bind(v, IDX_BATT_V, p, &p.vBattery, &p.battery);
+                Bind(v, &p.vBattery);
                 return;
 
             case HidCollection::INPUT:
-                Bind(v, IDX_INPUT_V, p, &p.vInput, &p.input);
+                Bind(v, &p.vInput);
                 return;
 
             default:
-                if (!p.vInput.IsValid()) {
-                    Bind(v, IDX_INPUT_V, p, &p.vInput, &p.input);
-                }
                 return;
             }
         }
@@ -443,33 +365,25 @@ namespace Ups {
 
     class HidReportReader {
     public:
-
-        // Fallback report IDs still work on firmware with an unreadable descriptor
-        // 
-        // so a parse failure leaves the reader usable
-        //
         bool Open(hid_device* dev, const std::string& path) {
             Close();
             dev_ = dev;
             if (!dev_) return false;
 
-            const bool parsed = CapabilitiesParser::Parse(path, profile_, ppd_);
-            if (!parsed) {
-                LOG_ERROR("HID caps parse failed, using fallback report IDs");
-                profile_ = ModelProfile{};
-                ppd_.Reset();
+            if (!CapabilitiesParser::Parse(path, profile_, ppd_)) {
+                LOG_ERROR("HID caps parse failed");
+                Close();
+                return false;
             }
 
             // Buffer length must match FeatureReportByteLength because hidapi and
-            // 
             // the HID parser both reject shorter reports
-            //
             buf_.assign(
                 std::max(profile_.featureLen, HidReportConfig::MIN_FEATURE_LEN),
                 0
             );
 
-            return parsed;
+            return true;
         }
 
         void Close() noexcept {
@@ -480,29 +394,6 @@ namespace Ups {
         }
 
         [[nodiscard]] const ModelProfile& Profile() const noexcept { return profile_; }
-        [[nodiscard]] uint8_t Rid(ReportIndex i) const noexcept { return profile_.GetRID(i); }
-        [[nodiscard]] size_t InputLen() const noexcept { return profile_.inputLen; }
-
-        [[nodiscard]] const uint8_t* Data() const noexcept { return buf_.data(); }
-        [[nodiscard]] size_t Size() const noexcept { return buf_.size(); }
-
-        bool ReadFeature(uint8_t rid) {
-            if (!dev_ || !rid || buf_.size() < HidReportConfig::MIN_FEATURE_LEN) {
-                return false;
-            }
-
-            std::fill(buf_.begin(), buf_.end(), 0);
-            buf_[0] = rid;
-
-            return hid_get_feature_report(dev_, buf_.data(), buf_.size()) > 0;
-        }
-
-        // Let the Windows HID parser locate the field
-        // 
-        // 
-        // Hardcoded byte offsets land on neighbouring bits 
-        // in packed reports and yield 0.0 V readings
-        //
 
         bool ReadValue(const ValueRef& r, float& out) {
             if (!r.IsValid() || !ppd_ || !ReadFeature(r.reportId)) return false;
@@ -525,52 +416,37 @@ namespace Ups {
             return true;
         }
 
-        // parse first and fixed-offset decoder second
-        // 
-        // devices without preparsed data keep reporting
-        //
-        template <class LegacyDecode>
-        bool ReadMetric(
-            const ValueRef& ref,
-            ReportIndex idx,
-            float& out,
-            LegacyDecode decode)
-        {
-            if (ReadValue(ref, out)) return true;
-            if (!ReadFeature(Rid(idx))) return false;
+        bool WriteValue(const ValueRef& r, uint32_t raw) {
+            if (!r.IsValid() || !ppd_ || !ReadFeature(r.reportId)) return false;
 
-            out = decode(buf_.data());
-            return true;
-        }
+            const NTSTATUS st = HidP_SetUsageValue(
+                HidP_Feature,
+                r.page,
+                r.link,
+                r.usage,
+                raw,
+                ppd_.Get(),
+                reinterpret_cast<PCHAR>(buf_.data()),
+                static_cast<ULONG>(buf_.size())
+            );
 
-        bool ReadByte(ReportIndex idx, uint8_t& out) {
-            if (!ReadFeature(Rid(idx))) return false;
+            if (st != HIDP_STATUS_SUCCESS) return false;
 
-            out = buf_[1];
-            return true;
-        }
-
-        bool WriteByte(ReportIndex idx, uint8_t value) {
-            if (!ReadFeature(Rid(idx))) return false;
-
-            buf_[1] = value;
             return hid_send_feature_report(dev_, buf_.data(), buf_.size()) >= 0;
         }
 
-        bool ReadFrequency(const HidValueInfo& info, float& out) {
-            if (!info.IsValid() || !ReadFeature(info.reportId)) return false;
-
-            out = FrequencyDecoder::Decode(buf_.data(), info.Is16bit());
-            return Validators::IsValidFrequency(out);
-        }
-
-        int ReadInput(uint8_t* data, size_t len, int timeoutMs) {
-            if (!dev_) return -1;
-
-            return hid_read_timeout(dev_, data, len, timeoutMs);
-        }
-
     private:
+        bool ReadFeature(uint8_t rid) {
+            if (!dev_ || !rid || buf_.size() < HidReportConfig::MIN_FEATURE_LEN) {
+                return false;
+            }
+
+            std::fill(buf_.begin(), buf_.end(), 0);
+            buf_[0] = rid;
+
+            return hid_get_feature_report(dev_, buf_.data(), buf_.size()) > 0;
+        }
+
         hid_device* dev_ = nullptr;
         PreparsedDataPtr     ppd_;
         ModelProfile         profile_;

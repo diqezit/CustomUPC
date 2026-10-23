@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <initializer_list>
 #include <string>
+#include <utility>
 
 namespace Ups {
 
@@ -282,7 +284,7 @@ namespace Ups {
     struct DisplayCache {
         enum Metric : int {
             BatteryVoltage, InputVoltage, Runtime, OutputVoltage,
-            Frequency, Avr, Sensitivity, Beeper, MetricCount
+            Avr, Sensitivity, Beeper, MetricCount
         };
         enum Bar : int { Charge, Load, BarCount };
 
@@ -324,13 +326,15 @@ namespace Ups {
         }
 
         void FillMetrics(const UpsState& s) {
+            const bool liveBatt = HasValidBatteryVoltage(s);
             const bool liveIn = HasValidInputVoltage(s) && !s.onBattery;
             const AvrStatus avr = s.ext.hasAvr
-                ? ParseAvrStatus(s.ext.avrRaw, s.ext.avrPowerFlags)
+                ? ParseAvrStatus(s.ext.avrRaw)
                 : AvrStatus::Unknown;
 
             Put(BatteryVoltage, "Battery Voltage",
-                Formatter::FormatVoltage(s.batteryVoltage), GetBatteryHealth(s));
+                liveBatt ? Formatter::FormatVoltage(s.batteryVoltage) : "--",
+                liveBatt ? GetBatteryHealth(s) : Health::Unknown);
             Put(InputVoltage, "Input Voltage",
                 liveIn ? Formatter::FormatVoltage(s.inputVoltage) : "--",
                 GetInputHealth(s));
@@ -339,8 +343,6 @@ namespace Ups {
 
             Opt(OutputVoltage, "Output Voltage",
                 Formatter::FormatVoltage(s.ext.outputVoltage), s.ext.hasOutput);
-            Opt(Frequency, "Frequency",
-                Formatter::FormatFrequency(s.ext.inputFrequency), s.ext.hasInputFreq);
             Opt(Avr, "AVR Status",
                 Formatter::FormatAvrStatus(avr),
                 avr != AvrStatus::Unknown, Theme::ColorOf(avr));
@@ -388,15 +390,18 @@ namespace Ups {
         DisplayCache cache;
         Extended     ext{};
 
-        void Poll(UpsDevice& device) {
-            if (GetTickCount64() - lastUpdate_ < Layout::POLL_INTERVAL_MS) {
-                return;
-            }
-
+        void Refresh(UpsDevice& device) {
             const UpsState s = device.ReadState();
             cache.Rebuild(s);
             ext = s.ext;
             lastUpdate_ = GetTickCount64();
+        }
+
+        void Poll(UpsDevice& device) {
+            if (GetTickCount64() - lastUpdate_ < Layout::POLL_INTERVAL_MS) {
+                return;
+            }
+            Refresh(device);
         }
 
     private:
@@ -407,10 +412,9 @@ namespace Ups {
     //                              CONFIG PANEL
     // ============================================================================
 
-    // Combo index is local
-    // 
-    // device code = index + offset
-    // 
+    // Combo indexes are local to the panel
+    //
+    // The device stores a code, so each setting maps its index back to that code
     struct ConfigPanel {
         [[nodiscard]] bool IsOpen() const noexcept { return open_; }
 
@@ -418,43 +422,99 @@ namespace Ups {
             open_ = true;
             beeper_.Load(e.hasBeeper, e.beeperCode);
             sens_.Load(e.hasSensitivity, e.sensitivity);
+            low_.Load(e.hasLowTransfer, e.lowTransferVoltage);
+            high_.Load(e.hasHighTransfer, e.highTransferVoltage);
         }
 
-        void Draw(UpsDevice& device) {
+        bool Draw(UpsDevice& device) {
             if (UI::WideButton("Back")) {
                 open_ = false;
-                return;
+                return false;
             }
 
             UI::Gap(Layout::GAP_CTRL);
-            beeper_.Draw([&](uint8_t v) { device.SetBeeper(v); });
-            sens_.Draw([&](uint8_t v) { device.SetSensitivity(v); });
+            bool changed = false;
+
+            changed |= beeper_.Draw([&](uint16_t v) {
+                return device.SetBeeper(static_cast<uint8_t>(v));
+            });
+
+            changed |= sens_.Draw([&](uint16_t v) {
+                return device.SetSensitivity(static_cast<uint8_t>(v));
+            });
+
+            if (low_.available || high_.available) {
+                ImGui::SeparatorText("Voltage");
+
+                changed |= low_.Draw([&](uint16_t v) {
+                    return device.SetLowTransfer(v);
+                });
+
+                changed |= high_.Draw([&](uint16_t v) {
+                    return device.SetHighTransfer(v);
+                });
+            }
+            return changed;
         }
 
     private:
         struct Setting {
             const char* label = "";
-            const char* items = "";
-            int         offset = 0;
+            std::string items;
+            int         first = 0;
+            int         last = 0;
             int         sel = 0;
+            bool        available = false;
 
-            void Load(bool available, uint8_t code) {
-                if (available) {
-                    sel = std::clamp(static_cast<int>(code) - offset, 0, 2);
-                }
+            Setting(const char* l, std::string i, int f, int lv)
+                : label(l), items(std::move(i)), first(f), last(lv) {}
+
+            void Load(bool present, uint16_t value) {
+                available = present;
+                if (!available) return;
+
+                // UPS can report a value outside the short list
+                // so snap to nearest option instead of leaving it blank
+                sel = std::clamp(static_cast<int>(value) - first, 0, last - first);
             }
 
             template<class Fn>
-            void Draw(Fn&& set) {
-                if (UI::Combo(label, &sel, items)) {
-                    set(static_cast<uint8_t>(sel + offset));
-                }
+            bool Draw(Fn&& set) {
+                if (!available) return false;
+                if (UI::Combo(label, &sel, items.c_str()))
+                    return set(static_cast<uint16_t>(first + sel));
+                return false;
             }
         };
 
+        static std::string Items(std::initializer_list<const char*> names) {
+            std::string items;
+            for (const char* name : names) {
+                items += name;
+                items.push_back('\0');
+            }
+            items.push_back('\0');
+            return items;
+        }
+
+        static std::string VoltageItems(int first, int last) {
+            std::string items;
+            for (int v = first; v <= last; ++v) {
+                items += std::to_string(v);
+                items += " V";
+                items.push_back('\0');
+            }
+            items.push_back('\0');
+            return items;
+        }
+
         bool    open_ = false;
-        Setting beeper_{ "Beeper", "Disabled\0Enabled\0Muted\0", 1 };
-        Setting sens_{ "Sensitivity", "Low\0Medium\0High\0", 0 };
+        Setting beeper_{ "Beeper", Items({ "Disabled", "Enabled", "Muted" }), 1, 3 };
+        Setting sens_{ "Sensitivity", Items({ "Low", "Medium", "High" }), 0, 2 };
+
+        // official PowerChute page limits these ranges to whole volts
+        Setting low_{ "Low transfer", VoltageItems(140, 150), 140, 150 };
+        Setting high_{ "High transfer", VoltageItems(290, 300), 290, 300 };
     };
 
     // ============================================================================
@@ -531,7 +591,8 @@ namespace Ups {
             UI::StatusHeader(view_.cache.status);
 
             if (config_.IsOpen()) {
-                config_.Draw(device_);
+                if (config_.Draw(device_))
+                    view_.Refresh(device_);
             }
             else {
                 MonitorPanel::Draw(view_, config_);
