@@ -1,21 +1,28 @@
 # UPS Monitor
 
-[![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?style=for-the-badge&logo=windows)](https://github.com/diqezit/CustomUPC)
-[![Language](https://img.shields.io/badge/Language-C%2B%2B20-00599C?style=for-the-badge&logo=cplusplus)](https://github.com/diqezit/CustomUPC)
-[![GUI](https://img.shields.io/badge/GUI-ImGui-4DB6AC?style=for-the-badge)](https://github.com/diqezit/CustomUPC)
-[![Graphics](https://img.shields.io/badge/Graphics-DirectX%2011-68BC71?style=for-the-badge&logo=nvidia)](https://github.com/diqezit/CustomUPC)
+<p align="center">
+  <a href="https://github.com/diqezit/CustomUPC"><img src="https://img.shields.io/badge/Platform-Windows-0078D6?style=for-the-badge&logo=windows" alt="Platform"></a>
+  <a href="https://github.com/diqezit/CustomUPC"><img src="https://img.shields.io/badge/Language-C%2B%2B20-00599C?style=for-the-badge&logo=cplusplus" alt="Language"></a>
+  <a href="https://github.com/diqezit/CustomUPC"><img src="https://img.shields.io/badge/GUI-ImGui-4DB6AC?style=for-the-badge" alt="GUI"></a>
+  <a href="https://github.com/diqezit/CustomUPC"><img src="https://img.shields.io/badge/Graphics-DirectX%2011-68BC71?style=for-the-badge&logo=nvidia" alt="Graphics"></a>
+</p>
 
 Lightweight Windows app for real-time monitoring of APC UPS devices via USB HID. Built with C++20, Dear ImGui and DirectX 11
 
 ## Features
 - Real-time monitoring of battery, input/output voltage, load, charge and runtime
 - AVR status for Automatic Voltage Regulation modes
+- Configurable beeper, transfer sensitivity, low and high transfer voltages
 - Modern dark-themed always-on-top draggable UI
 - Low resource usage with zero external dependencies
 - Auto-reconnect on USB disconnect
 
 ## Screenshot
-![Main Window Screenshot](https://github.com/user-attachments/assets/a8f2e847-557b-4890-9fe5-057a5c6267e0)
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/f6aff976-0eca-4ae6-b5ff-77729e78fb84" width="300" alt="Monitor">
+  <img src="https://github.com/user-attachments/assets/c94deb5c-e926-429c-84d9-42ebbddfddd2" width="300" alt="Settings">
+</p>
 
 ## Supported Devices
 Works with APC, MGE and Belkin UPS models supporting USB HID Power Device class
@@ -47,7 +54,7 @@ Data flow: UpsDevice -> UpsMonitor -> UpsState -> MainWindow
 
 ## Usage
 1. Connect your UPS via USB
-2. Run UpsMonitor.exe
+2. Run CustomUPC.exe
 3. Monitor real-time status
 
 Click and drag the header area to move the window
