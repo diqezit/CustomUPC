@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(CustomUPC VERSION 2.0 LANGUAGES CXX)
+project(CustomUPC VERSION 2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,9 +12,7 @@ if(WIN32)
 endif()
 
 # Define project directories
-set(SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src)
 set(LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/lib)
-set(RES_DIR ${CMAKE_CURRENT_SOURCE_DIR}/res)
 
 # Determine architecture for library paths
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -43,31 +41,31 @@ set_target_properties(imgui PROPERTIES
 
 # --- Main Executable ---
 
-set(CORE_HEADERS
-    ${SRC_DIR}/core/UpsState.h
-    ${SRC_DIR}/core/HidDevice.h
-    ${SRC_DIR}/core/UpsDevice.h
-    ${SRC_DIR}/core/UpsMonitor.h
+set(SOURCES
+    src/main.cpp
+    src/UpsDevice.cpp
+    src/MainWindow.cpp
+    src/Logger.c
 )
 
-set(UTILS_HEADERS
-    ${SRC_DIR}/utils/Logger.h
-    ${SRC_DIR}/utils/Utf.h
+set(HEADERS
+    src/headers/UpsState.h
+    src/headers/UpsDevice.h
+    src/headers/MainWindow.h
+    src/headers/Logger.h
 )
 
 add_executable(${PROJECT_NAME} WIN32
-    ${SRC_DIR}/main.cpp
-    ${SRC_DIR}/UI/MainWindow.h
-    ${CORE_HEADERS}
-    ${UTILS_HEADERS}
-    ${RES_DIR}/CustomUPC.rc
+    ${SOURCES}
+    ${HEADERS}
+    res/CustomUPC.rc
 )
 
 # Include directories
-target_include_directories(${PROJECT_NAME} PRIVATE ${SRC_DIR})
+target_include_directories(${PROJECT_NAME} PRIVATE src/headers)
 
 # Link libraries
-# hid.lib provides HidP_* descriptor parsing used by core/HidReport.h
+# hid.lib provides HidP_* descriptor parsing used by UpsDevice.cpp
 target_link_libraries(${PROJECT_NAME} PRIVATE
     imgui
     hidapi
@@ -81,7 +79,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 if(MSVC)
     target_compile_definitions(${PROJECT_NAME} PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
     # High warning level, disable permissive mode
-    target_compile_options(${PROJECT_NAME} PRIVATE /W4 /permissive-)
+    target_compile_options(${PROJECT_NAME} PRIVATE /W4 "$<$<COMPILE_LANGUAGE:CXX>:/permissive->")
 endif()
 
 # Output directories configuration
@@ -108,10 +106,6 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMENT "Copying runtime DLLs to output directory..."
 )
 
-# --- Source Groups (Visual Studio Filters) ---
-
-source_group("Source" FILES ${SRC_DIR}/main.cpp)
-source_group("Headers\\UI" FILES ${SRC_DIR}/UI/MainWindow.h)
-source_group("Headers\\Core" FILES ${CORE_HEADERS})
-source_group("Headers\\Utils" FILES ${UTILS_HEADERS})
-source_group("Resources" FILES ${RES_DIR}/CustomUPC.rc)
+source_group("src" FILES ${SOURCES})
+source_group("src\\headers" FILES ${HEADERS})
+source_group("" FILES res/CustomUPC.rc)

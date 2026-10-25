@@ -1,21 +1,13 @@
-#include "ui/MainWindow.h"
-#include "utils/Logger.h"
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-
-#include <windows.h>
-#include <windowsx.h>
-#include <d3d11.h>
-#include <wrl/client.h>
+#include "MainWindow.h"
+#include "Logger.h"
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 
+#include <windowsx.h>
+#include <wrl/client.h>
 #include <filesystem>
-#include <memory>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
     HWND, UINT, WPARAM, LPARAM);
@@ -23,243 +15,215 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 namespace {
 
     using Microsoft::WRL::ComPtr;
-    using Ups::Logger;
-    using Ups::MainWindow;
 
-    constexpr wchar_t kWindowClass[] = L"UpsMon";
-    constexpr wchar_t kMutexName[] = L"UpsMonitor_SingleInstance";
-    constexpr wchar_t kWindowTitle[] = L"UPS";
-    constexpr int     kCloseBtnW = 40;
-    constexpr DWORD   kFrameDelayMs = 16;
+    constexpr wchar_t WINDOW_CLASS[] = L"UpsMon";
+    constexpr wchar_t MUTEX_NAME[] = L"UpsMonitor_SingleInstance";
+    constexpr wchar_t LOG_NAME[] = L"ups_monitor.log";
 
-    // ============================================================================
-    //                              HANDLE RAII
-    // ============================================================================
+    constexpr int WIDTH = 300;
+    constexpr int HEIGHT = 330;
+    constexpr int MARGIN = 16;
+    constexpr int TASKBAR_H = 50;
+    constexpr int CAPTION_H = 50;
+    constexpr int CLOSE_W = 40;
+    constexpr int FRAME_MS = 50;
 
-    struct HandleCloser {
-        void operator()(HANDLE h) const noexcept {
-            if (h) CloseHandle(h);
-        }
-    };
-    using UniqueHandle = std::unique_ptr<std::remove_pointer_t<HANDLE>, HandleCloser>;
+    struct D3d {
+        ComPtr<ID3D11RenderTargetView> target;
+        ComPtr<IDXGISwapChain> swap;
+        ComPtr<ID3D11DeviceContext> context;
+        ComPtr<ID3D11Device> gpu;
+    } d3d;
 
     void OpenLog() {
-        wchar_t exe[MAX_PATH]{};
-        GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        Logger::Instance().Open(
-            (std::filesystem::path(exe).parent_path() / "ups_monitor.log").string());
+        wchar_t path[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+
+        const auto logPath =
+            std::filesystem::path(path).parent_path() / LOG_NAME;
+        LogOpen(logPath.c_str());
     }
 
-    POINT WindowOrigin() {
-        return {
-            GetSystemMetrics(SM_CXSCREEN)
-                - static_cast<int>(Ups::Layout::WINDOW_WIDTH)
-                - static_cast<int>(Ups::Layout::MARGIN),
-            GetSystemMetrics(SM_CYSCREEN)
-                - static_cast<int>(Ups::Layout::WINDOW_HEIGHT)
-                - static_cast<int>(Ups::Layout::TASKBAR_H)
-        };
+    bool CreateTarget() {
+        ComPtr<ID3D11Texture2D> buffer;
+        if (FAILED(d3d.swap->GetBuffer(0, IID_PPV_ARGS(&buffer))))
+            return false;
+
+        return SUCCEEDED(d3d.gpu->CreateRenderTargetView(
+            buffer.Get(), nullptr, &d3d.target));
     }
 
-    // ============================================================================
-    //                              D3D11 BACKEND
-    // ============================================================================
+    bool InitD3d(HWND window) {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        desc.BufferCount = 2;
+        desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        desc.OutputWindow = window;
+        desc.SampleDesc.Count = 1;
+        desc.Windowed = TRUE;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
-    struct D3d11 {
-        ComPtr<ID3D11Device>           device;
-        ComPtr<ID3D11DeviceContext>    context;
-        ComPtr<IDXGISwapChain>         swapChain;
-        ComPtr<ID3D11RenderTargetView> rtv;
+        const HRESULT status = D3D11CreateDeviceAndSwapChain(
+            nullptr,
+            D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,
+            0,
+            nullptr,
+            0,
+            D3D11_SDK_VERSION,
+            &desc,
+            &d3d.swap,
+            &d3d.gpu,
+            nullptr,
+            &d3d.context);
 
-        bool Init(HWND hwnd) {
-            DXGI_SWAP_CHAIN_DESC sd{};
-            sd.BufferCount = 2;
-            sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-            sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-            sd.OutputWindow = hwnd;
-            sd.SampleDesc.Count = 1;
-            sd.Windowed = TRUE;
-            sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        if (FAILED(status))
+            return false;
 
-            if (FAILED(D3D11CreateDeviceAndSwapChain(
-                nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-                nullptr, 0, D3D11_SDK_VERSION,
-                &sd, &swapChain, &device, nullptr, &context)))
-            {
-                return false;
-            }
-            return CreateRTV();
+        return CreateTarget();
+    }
+
+    void ResizeD3d() {
+        d3d.target.Reset();
+
+        if (SUCCEEDED(d3d.swap->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0)))
+            CreateTarget();
+    }
+
+    void Render() {
+        if (!d3d.target)
+            return;
+
+        constexpr float clear[] = { 0, 0, 0, 0 };
+        d3d.context->OMSetRenderTargets(
+            1, d3d.target.GetAddressOf(), nullptr);
+        d3d.context->ClearRenderTargetView(d3d.target.Get(), clear);
+
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        d3d.swap->Present(1, 0);
+    }
+
+    LRESULT CALLBACK WindowProc(
+        HWND window, UINT message, WPARAM wp, LPARAM lp) {
+        if (ImGui_ImplWin32_WndProcHandler(window, message, wp, lp))
+            return 1;
+
+        switch (message) {
+        case WM_NCHITTEST: {
+            POINT point{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            ScreenToClient(window, &point);
+
+            if (point.y < CAPTION_H && point.x < WIDTH - CLOSE_W)
+                return HTCAPTION;
+
+            return HTCLIENT;
         }
+        case WM_SIZE:
+            if (d3d.gpu && wp != SIZE_MINIMIZED)
+                ResizeD3d();
 
-        bool CreateRTV() {
-            ComPtr<ID3D11Texture2D> backBuffer;
-            if (FAILED(swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer)))) {
-                return false;
-            }
-            return SUCCEEDED(device->CreateRenderTargetView(backBuffer.Get(), nullptr, &rtv));
-        }
+            return 0;
 
-        void Resize() {
-            if (!swapChain) return;
-            rtv.Reset();
-            swapChain->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0);
-            CreateRTV();
-        }
-
-        void Present() {
-            if (!context || !rtv) return;
-
-            constexpr float kClear[] = { 0.f, 0.f, 0.f, 0.f };
-            context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
-            context->ClearRenderTargetView(rtv.Get(), kClear);
-            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-            swapChain->Present(1, 0);
-        }
-
-        void Shutdown() {
-            rtv.Reset();
-            swapChain.Reset();
-            context.Reset();
-            device.Reset();
-        }
-    };
-
-    // ============================================================================
-    //                              APPLICATION
-    // ============================================================================
-
-    class Application {
-    public:
-        int Run(HINSTANCE instance) {
-            instance_ = instance;
-
-            UniqueHandle mutex(CreateMutexW(nullptr, TRUE, kMutexName));
-            if (GetLastError() == ERROR_ALREADY_EXISTS) {
-                MessageBoxW(nullptr, L"Already running", L"UPS Monitor", MB_ICONINFORMATION);
-                return 0;
-            }
-
-            OpenLog();
-            LOG_INFO("Application starting...");
-
-            if (!CreateHwnd() ||
-                !d3d_.Init(hwnd_) ||
-                !ui_.Init(hwnd_, d3d_.device.Get(), d3d_.context.Get()))
-            {
-                LOG_ERROR("Failed to create main window");
-                Cleanup();
-                Logger::Instance().Close();
-                return 1;
-            }
-
-            ShowWindow(hwnd_, SW_SHOWDEFAULT);
-            UpdateWindow(hwnd_);
-            LOG_INFO("Main window created");
-
-            Loop();
-
-            LOG_INFO("Shutting down");
-            Cleanup();
-            Logger::Instance().Close();
+        case WM_DESTROY:
+            PostQuitMessage(0);
             return 0;
         }
 
-    private:
-        HWND        hwnd_ = nullptr;
-        HINSTANCE   instance_ = nullptr;
-        D3d11       d3d_;
-        MainWindow  ui_;
+        return DefWindowProcW(window, message, wp, lp);
+    }
 
-        bool CreateHwnd() {
-            const WNDCLASSEXW wc{
-                sizeof(wc), CS_CLASSDC, &WndProc, 0, 0, instance_,
-                nullptr, LoadCursor(nullptr, IDC_ARROW),
-                nullptr, nullptr, kWindowClass, nullptr
-            };
-            if (!RegisterClassExW(&wc)) {
-                return false;
+    HWND CreateHwnd(HINSTANCE instance) {
+        const WNDCLASSEXW cls{
+            .cbSize = sizeof(cls),
+            .style = CS_CLASSDC,
+            .lpfnWndProc = WindowProc,
+            .hInstance = instance,
+            .hCursor = LoadCursor(nullptr, IDC_ARROW),
+            .lpszClassName = WINDOW_CLASS
+        };
+
+        if (!RegisterClassExW(&cls))
+            return nullptr;
+
+        const int x = GetSystemMetrics(SM_CXSCREEN) - WIDTH - MARGIN;
+        const int y = GetSystemMetrics(SM_CYSCREEN) - HEIGHT - TASKBAR_H;
+
+        return CreateWindowExW(
+            WS_EX_TOPMOST,
+            WINDOW_CLASS,
+            L"UPS",
+            WS_POPUP | WS_VISIBLE,
+            x, y, WIDTH, HEIGHT,
+            nullptr,
+            nullptr,
+            instance,
+            nullptr);
+    }
+
+    void Loop() {
+        MSG message{};
+
+        while (true) {
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if (message.message == WM_QUIT)
+                    return;
+
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
             }
 
-            const POINT pos = WindowOrigin();
-            hwnd_ = CreateWindowExW(
-                WS_EX_TOPMOST, kWindowClass, kWindowTitle, WS_POPUP | WS_VISIBLE,
-                pos.x, pos.y,
-                static_cast<int>(Ups::Layout::WINDOW_WIDTH),
-                static_cast<int>(Ups::Layout::WINDOW_HEIGHT),
-                nullptr, nullptr, instance_, this);
+            if (!Ups::UiFrame())
+                return;
 
-            return hwnd_ != nullptr;
+            Render();
+            Sleep(FRAME_MS);
         }
+    }
 
-        void Loop() {
-            MSG msg{};
-            while (ui_.IsRunning()) {
-                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                    if (msg.message == WM_QUIT) {
-                        ui_.RequestClose();
-                    }
-                }
-                ui_.Tick();
-                d3d_.Present();
-                Sleep(kFrameDelayMs);
-            }
-        }
+    // release graphics resources before destroying swap chain window
+    void CloseApp(HWND window, HINSTANCE instance) {
+        Ups::UiClose();
+        d3d = {};
 
-        void Cleanup() {
-            ui_.Shutdown();
-            d3d_.Shutdown();
-            if (hwnd_) {
-                DestroyWindow(hwnd_);
-                hwnd_ = nullptr;
-            }
-            UnregisterClassW(kWindowClass, instance_);
-        }
+        if (window)
+            DestroyWindow(window);
 
-        static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-            if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) {
-                return 1;
-            }
-
-            if (msg == WM_NCCREATE) {
-                auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA,
-                    reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
-            }
-
-            auto* self = reinterpret_cast<Application*>(
-                GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-
-            switch (msg) {
-            case WM_NCHITTEST: {
-                POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-                ScreenToClient(hwnd, &pt);
-                const bool caption =
-                    pt.y < Ups::Layout::CAPTION_H &&
-                    pt.x < Ups::Layout::WINDOW_WIDTH - kCloseBtnW;
-                return caption ? HTCAPTION : HTCLIENT;
-            }
-            case WM_SIZE:
-                if (self && self->d3d_.device && wp != SIZE_MINIMIZED) {
-                    self->d3d_.Resize();
-                }
-                return 0;
-            case WM_DESTROY:
-                PostQuitMessage(0);
-                return 0;
-            }
-            return DefWindowProcW(hwnd, msg, wp, lp);
-        }
-    };
+        UnregisterClassW(WINDOW_CLASS, instance);
+    }
 
 } // namespace
 
-int WINAPI wWinMain(
-    _In_ HINSTANCE instance,
-    _In_opt_ HINSTANCE,
-    _In_ LPWSTR,
-    _In_ int)
-{
-    return Application().Run(instance);
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
+    HANDLE mutex = CreateMutexW(nullptr, TRUE, MUTEX_NAME);
+    if (!mutex)
+        return 1;
+
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBoxW(
+            nullptr, L"Already running", L"UPS Monitor", MB_ICONINFORMATION);
+        CloseHandle(mutex);
+        return 0;
+    }
+
+    OpenLog();
+    LOG_INFO("Application starting...");
+
+    int exitCode = 0;
+    HWND window = CreateHwnd(instance);
+    if (window && InitD3d(window)) {
+        Ups::UiInit(window, d3d.gpu.Get(), d3d.context.Get());
+        LOG_INFO("Main window created");
+        Loop();
+        LOG_INFO("Shutting down");
+    }
+    else {
+        LOG_ERROR("Failed to create main window");
+        exitCode = 1;
+    }
+
+    CloseApp(window, instance);
+    LogClose();
+    CloseHandle(mutex);
+
+    return exitCode;
 }

@@ -10,11 +10,14 @@
 Lightweight Windows app for real-time monitoring of APC UPS devices via USB HID. Built with C++20, Dear ImGui and DirectX 11
 
 ## Features
-- Real-time monitoring of battery, input/output voltage, load, charge and runtime
+- Real-time monitoring of battery and input voltage, load, charge and runtime
+- Output voltage only when exposed by device descriptor
 - AVR status for Automatic Voltage Regulation modes
+- Hardware low-battery and imminent-shutdown warnings when exposed by descriptor
+- Read-only Details page with rated power, nominal voltages, manufacture dates, runtime limit and last transfer reason
 - Configurable beeper, transfer sensitivity, low and high transfer voltages
 - Modern dark-themed always-on-top draggable UI
-- Low resource usage with zero external dependencies
+- Low resource usage with bundled runtime DLLs
 - Auto-reconnect on USB disconnect
 
 ## Screenshot
@@ -25,15 +28,15 @@ Lightweight Windows app for real-time monitoring of APC UPS devices via USB HID.
 </p>
 
 ## Supported Devices
-Works with APC, MGE and Belkin UPS models supporting USB HID Power Device class
-Vendor IDs: APC 0x051D, MGE 0x0463, Belkin 0x050D
+APC USB HID devices, vendor ID 0x051D
+Tested with Back-UPS XS 650CI; available readings and settings depend on descriptor
 
 ## Reverse Engineering
-Uses IDA Pro reverse engineering of official APC PowerChute software to uncover hidden HID report IDs and scaling factors for accurate voltage and status readings
+Uses HID descriptor fields and mappings checked against official APC PowerChute software
 
 ## Build Requirements
 Visual Studio 2022, CMake 3.20+ and Windows SDK 10.0+
-Header-only dependencies for HIDAPI and ImGui are included
+HIDAPI and ImGui headers, import libraries and runtime DLLs are included
 
 ```bash
 git clone https://github.com/diqezit/CustomUPC
@@ -42,15 +45,18 @@ cmake -B build
 cmake --build build --config Release
 ```
 
-## Architecture
+## Source files
 | Module | Purpose |
 |--------|---------|
-| UpsState.h | Data structures, enums and constants |
-| UpsMonitor.h | Data processing, validation and formatting |
-| UpsDevice.h | USB HID communication and device management |
-| MainWindow.h | UI rendering with ImGui and DirectX11 |
+| src/headers/UpsState.h | Plain UPS data and setting codes |
+| src/headers/UpsDevice.h | Device interface and descriptor field types |
+| src/UpsDevice.cpp | HID parsing, polling and existing settings |
+| src/headers/MainWindow.h | Three UI entry points |
+| src/MainWindow.cpp | Formatting, display cache and ImGui rendering |
+| src/main.cpp | Win32 window, DirectX 11 and message loop |
+| src/headers/Logger.h and src/Logger.c | Small C logging API |
 
-Data flow: UpsDevice -> UpsMonitor -> UpsState -> MainWindow
+Data flow: USB HID -> UpsDevice -> UpsState -> UI
 
 ## Usage
 1. Connect your UPS via USB
@@ -58,6 +64,10 @@ Data flow: UpsDevice -> UpsMonitor -> UpsState -> MainWindow
 3. Monitor real-time status
 
 Click and drag the header area to move the window
+Open Details for values reported by UPS. Manufacture dates are not replacement dates, and rated power is not measured load
+
+Runtime limit is shown read-only in Details in minutes and represents a warning threshold, not a power-off delay
+Use Tab, arrow keys and Enter for native keyboard navigation
 
 Status indicators:
 - ONLINE: Normal operation on AC power
@@ -67,6 +77,8 @@ Status indicators:
 - OVERLOAD: UPS overloaded
 - REPLACE BATTERY: Battery needs replacement
 - DISCONNECTED: No UPS detected
+- LOW BATTERY: UPS reports charge below its capacity limit
+- UPS SHUTDOWN SOON: UPS reports imminent shutdown
 
 ## Troubleshooting
 - UPS not detected: Check USB cable/port, verify in Device Manager, run as Administrator
